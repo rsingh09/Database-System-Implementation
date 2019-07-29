@@ -1,0 +1,293 @@
+
+#include <iostream>
+#include "Statistics.h"
+#include "ParseTree.h"
+#include "QueryPlanTree.h"
+
+using namespace std;
+
+extern "C" {
+	int yyparse(void);   // defined in y.tab.c
+}
+
+extern struct FuncOperator *finalFunction;
+extern struct TableList *tables;
+extern struct AndList *boolean;
+extern struct NameList *groupingAtts;
+extern struct NameList *attsToSelect;
+extern int distinctAtts; // 1 if there is a DISTINCT in a non-aggregate query 
+extern int distinctFunc;// 1 if there is a DISTINCT in an aggregate query
+
+using namespace std;
+
+vector<AndList> joinOptimization(vector<AndList> joins, Statistics *stats)
+{
+	vector<AndList> optimizedList;
+	optimizedList.reserve(joins.size);
+	int counter = 0;
+	while (joins.size() > 1)
+	{
+		double currCost = -99.0;
+		int selectedItr = 0;		
+		for (int i = 0; i < joins.size(); i++)
+		{
+			double newCost = 0.0;
+			double cost = 0.0;
+			string tbl1 = getTableName(joins[i].left->left->left->value);
+			string tbl2 = getTableName(joins[i].left->left->right->value);
+			char* tblList[] = { (char*)tbl1.c_str(), (char*)tbl2.c_str() };
+			newCost = stats->Estimate(&joins[i], tblList, 2);
+			selectedItr = i;
+			if (currCost = -99 || currCost > newCost)
+			{
+				currCost - newCost;
+				selectedItr = i;
+			}
+		}
+		optimizedList.push_back(joins[selectedItr]);
+		joins.erase(joins.begin() + selectedItr);
+		counter++;
+	}
+	optimizedList.insert(joins.begin()+counter, joins[0]);
+	return optimizedList;
+	//return NULL;
+}
+
+string getTableName(string tblAttr)
+{
+	//string tableName = op->value;
+	size_t pos = tblAttr.find(".");
+	return tblAttr.substr(0, pos);
+}
+
+int main() {
+	int pipeID = 1;
+	cout << "Enter the Query followed by Ctrl + D:" << endl;
+	Statistics *stats = new Statistics();
+	stats->Read("Statistics.txt");
+	yyparse();
+	//cout << finalFunction->code << endl;
+	cout << tables->tableName << endl;
+	if (groupingAtts != NULL)
+		cout << groupingAtts->name;
+	if (attsToSelect != NULL)
+		cout << "select " << attsToSelect->name << endl;
+	if (distinctAtts != NULL)
+		cout << "Att " << distinctAtts << endl;
+	if (distinctFunc != NULL)
+		cout << "Fun " << distinctFunc << endl;
+	if (boolean != NULL)
+	{
+		cout << "and " << boolean->left << endl;
+		cout << "and " << boolean->rightAnd << endl;
+	}
+	if (finalFunction != NULL)
+	{
+		cout << "Att " << finalFunction->code << endl;
+		cout << "Att " << finalFunction->leftOperand->value << endl;
+	}
+
+	//Get the list of the table and create leaf nodes
+	TableList *tempTblList = tables;
+	vector<string> tableList;
+	map<string, QueryPlanTree*> leafNodes;
+	QueryPlanTree *lastInserted = NULL;
+
+	while (tempTblList)
+	{
+		QueryPlanTree *tmpNode = NULL;
+		if (tempTblList->aliasAs != 0)
+		{
+			tableList.push_back(tempTblList->aliasAs);
+			cout << "Table name: " << tempTblList->aliasAs << " Alias: " << tempTblList->tableName << endl;
+			leafNodes.insert(std::pair<string, QueryPlanTree*>(tempTblList->aliasAs, new QueryPlanTree()));
+			stats->CopyRel(tempTblList->tableName, tempTblList->aliasAs);
+		}
+		else
+		{
+			tableList.push_back(tempTblList->tableName);
+			leafNodes.insert(std::pair<string, QueryPlanTree*>(tempTblList->tableName, new QueryPlanTree()));
+			cout << "Table name: " << tempTblList->tableName << endl;
+		}
+		tempTblList = tempTblList->next;
+		tmpNode = leafNodes[tempTblList->tableName];
+		tmpNode->nodeSchema = new Schema("catalog", tempTblList->tableName);
+
+		tmpNode->outputPipes.pipeID = pipeID++;
+		tmpNode->type = SELECTFILE;
+		tempTblList = tempTblList->next;
+		//topnode part
+		lastInserted = tmpNode;
+
+	}
+	//Generated leaf nodes
+	/*
+	Now get the list of and and or and joins
+	*/
+	vector<AndList> joinlist;
+	vector<AndList> havingList;
+	vector<AndList> whereList;
+	OrList *tblOrlist;
+	while (boolean != 0)
+	{
+		//cout << "Here" <<endl;
+		AndList tmpList = *boolean;
+		tblOrlist = boolean->left;
+		if (tblOrlist && tblOrlist->left->code == EQUALS && tblOrlist->left->left->code == NAME
+			&& tblOrlist->left->right->code == NAME)
+		{
+			tmpList = *boolean;
+			tmpList.rightAnd = 0;
+			joinlist.push_back(tmpList);
+			//cout << "Value: " << endl;
+		}
+		else if (tblOrlist->left == 0)
+		{
+			tmpList.rightAnd = 0;
+			whereList.push_back(tmpList);
+		}
+		else
+		{
+			vector<string> orTables;
+			while (tblOrlist != 0)
+			{
+				Operand *op = tblOrlist->left->left;
+				if (op->code != NAME)
+					op = tblOrlist->left->right;
+				string tableName = getTableName(op->value);
+				cout << "Value x:" << op->value << " :" << "tableName:" << tableName << endl;
+				//tableName = 
+				if (find(orTables.begin(), orTables.end(), tableName) == orTables.end())
+					orTables.push_back(tableName);
+				tblOrlist = tblOrlist->rightOr;
+			}
+			if (orTables.size() > 1) {
+				AndList newAnd = *boolean;
+				newAnd.rightAnd = 0;
+				havingList.push_back(newAnd);
+			}
+			else {
+				AndList newAnd = *boolean;
+				newAnd.rightAnd = 0;
+				whereList.push_back(newAnd);
+			}
+		}
+		boolean = boolean->rightAnd;
+	}
+	//Filled every thing
+	//Start building the tree adding the where
+	for (unsigned i = 0; i < whereList.size(); i++)
+	{
+		QueryPlanTree *tmpNode;
+		string tablename;
+		if (whereList[i].left->left->left->code == NAME)
+		{
+			tablename = getTableName(whereList[i].left->left->left->value);
+		}
+		else
+			tablename = getTableName(whereList[i].left->left->right->value);
+		tmpNode = leafNodes[tablename];
+		while (tmpNode->parent != NULL)
+		{
+			tmpNode = tmpNode->parent;
+		}
+		QueryPlanTree *newNode = new QueryPlanTree(tmpNode, SELECTPIPE, &whereList[i], pipeID++);
+		tmpNode->parent = newNode;
+		/*newNode->nodeSchema = tmpNode->nodeSchema;
+		newNode->leftChild = tmpNode;
+		newNode->type = SELECTPIPE;
+		newNode->cnf = &whereList[i];
+		newNode->leftPipe.pipeID = tmpNode->outputPipes.pipeID;
+		newNode->outputPipes.pipeID = pipeID++;*/
+		char *statTbl = strdup(tablename.c_str());
+		stats->Apply(&whereList[i], &statTbl, 1);
+		//topnode
+		lastInserted = newNode;
+	}
+	if (joinlist.size() > 1) {
+		joinlist = joinOptimization(joinlist, stats);
+	}
+
+	// Add the joins as node
+	AndList curJoin;
+	//string tbl1;
+	//string tbl2;
+	for (int i = 0; i < joinlist.size(); i++)
+	{
+		QueryPlanTree *leftNode;
+		QueryPlanTree *rightNode;
+		string tbl1 = getTableName(joinlist[i].left->left->left->value);
+		string tbl2 = getTableName(joinlist[i].left->left->right->value);
+
+		leftNode = leafNodes[tbl1];
+		rightNode = leafNodes[tbl2];
+		while (leftNode->parent != NULL)
+			leftNode->parent;
+		while (rightNode->parent != NULL)
+			rightNode->parent;
+		QueryPlanTree *newNode = new QueryPlanTree(leftNode, rightNode, JOIN, &joinlist[i], pipeID++);
+
+		/*newNode->type = JOIN;
+		newNode->leftPipe.pipeID = leftNode->outputPipes.pipeID;
+		newNode->rightPipe.pipeID = rightNode->outputPipes.pipeID;
+		newNode->outputPipes.pipeID = pipeID++;
+		newNode->cnf = &joinlist[i];*/
+
+		newNode->leftChild = leftNode;
+		newNode->rightChild = rightNode;
+
+		leftNode->parent = rightNode->parent = newNode;
+		//newNode->nodeSchema = &mergeSchema("Join", leftNode, rightNode);
+		//topnode
+		lastInserted = newNode;
+
+	}
+
+	for (int i = 0; i < havingList.size(); i++)
+	{
+
+		QueryPlanTree *tmpNode = lastInserted;
+		QueryPlanTree *newNode = new QueryPlanTree(lastInserted, SELECTPIPE, &havingList[i], pipeID++);
+		tmpNode->parent = newNode;
+
+		/*newNode->nodeSchema = tmpNode->nodeSchema;
+		newNode->type = SELECTPIPE;
+		newNode->cnf = &havingList[i];
+		newNode->leftChild = tmpNode;
+		newNode->leftPipe.pipeID = tmpNode->leftPipe.pipeID;*/
+		lastInserted = newNode;
+	}
+
+
+	//Add joins 
+
+
+
+
+	/*TableList *tmpTblList = tables;
+	while (tmpTblList != 0)
+	{
+		QueryPlanTree *tmpNode = NULL;
+		if (tmpTblList->aliasAs != 0)
+		{
+			
+			//tmpNode = leafNodes[tmpTblList->aliasAs];
+		}
+		else
+		{
+			//tmpNode = leafNodes[tmpTblList->tableName];
+		}
+		
+	}
+
+	//getJoins();
+
+	//cout << tables->next->tableName << endl; 
+	*/
+}
+//
+//void getJoins()
+//{
+//
+//}
+
